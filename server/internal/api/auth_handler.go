@@ -1,0 +1,453 @@
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"net/http"
+	"time"
+
+	"lead-finder/internal/database"
+	"lead-finder/internal/models"
+	"lead-finder/internal/utils"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+)
+
+type SignupRequest struct {
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+	FirstName string `json:"firstName"`
+	LastName  string `json:"lastName"`
+}
+
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type AuthResponse struct {
+	Token string       `json:"token"`
+	User  UserResponse `json:"user"`
+}
+
+type UserResponse struct {
+	ID        string `json:"id"`
+	Email     string `json:"email"`
+	FirstName string `json:"firstName"`
+	LastName  string `json:"lastName"`
+	CreatedAt string `json:"createdAt"`
+}
+
+// SignupHandler handles user registration
+func SignupHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req SignupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Invalid request body"})
+		return
+	}
+
+	// Validate input
+	if req.Email == "" || req.Password == "" || req.FirstName == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Email, password, and first name are required"})
+		return
+	}
+
+	// Check if email already exists
+	db := database.Get()
+	usersCollection := db.Instance.Collection("users")
+
+	var existingUser models.User
+	err := usersCollection.FindOne(r.Context(), bson.M{"email": req.Email}).Decode(&existingUser)
+	if err == nil {
+		// User already exists
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Email already registered"})
+		return
+	} else if err != mongo.ErrNoDocuments {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Database error"})
+		return
+	}
+
+	// Hash password
+	hashedPassword, err := utils.HashPassword(req.Password)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Failed to process password"})
+		return
+	}
+
+	// Create new user
+	user := models.User{
+		Email:     req.Email,
+		Password:  hashedPassword,
+		FirstName: req.FirstName,
+		LastName:  req.LastName,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	result, err := usersCollection.InsertOne(r.Context(), user)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Failed to create user"})
+		return
+	}
+
+	// Generate JWT token
+	token, err := utils.GenerateJWT(result.InsertedID.(primitive.ObjectID).Hex(), req.Email, req.FirstName)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Failed to generate token"})
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(AuthResponse{
+		Token: token,
+		User: UserResponse{
+			ID:        result.InsertedID.(primitive.ObjectID).Hex(),
+			Email:     user.Email,
+			FirstName: user.FirstName,
+			LastName:  user.LastName,
+			CreatedAt: user.CreatedAt.Format(time.RFC3339),
+		},
+	})
+}
+
+// LoginHandler handles user login
+func LoginHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Invalid request body"})
+		return
+	}
+
+	// Validate input
+	if req.Email == "" || req.Password == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Email and password are required"})
+		return
+	}
+
+	// Find user
+	db := database.Get()
+	usersCollection := db.Instance.Collection("users")
+
+	var user models.User
+	err := usersCollection.FindOne(r.Context(), bson.M{"email": req.Email}).Decode(&user)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			// If there are no users at all, surface "user not found";
+			// otherwise this specific email is wrong.
+			userCount, countErr := usersCollection.CountDocuments(r.Context(), bson.M{})
+			if countErr != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"message": "Database error"})
+				return
+			}
+
+			w.WriteHeader(http.StatusUnauthorized)
+			if userCount == 0 {
+				json.NewEncoder(w).Encode(map[string]string{"message": "user not found"})
+			} else {
+				json.NewEncoder(w).Encode(map[string]string{"message": "wrong email entered"})
+			}
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"message": "Database error"})
+		}
+		return
+	}
+
+	// Verify password
+	if !utils.VerifyPassword(user.Password, req.Password) {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"message": "wrong password entered"})
+		return
+	}
+
+	// Generate JWT token
+	token, err := utils.GenerateJWT(user.ID.Hex(), user.Email, user.FirstName)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Failed to generate token"})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(AuthResponse{
+		Token: token,
+		User: UserResponse{
+			ID:        user.ID.Hex(),
+			Email:     user.Email,
+			FirstName: user.FirstName,
+			LastName:  user.LastName,
+			CreatedAt: user.CreatedAt.Format(time.RFC3339),
+		},
+	})
+}
+
+// LogoutHandler handles user logout (just returns success for frontend cleanup)
+func LogoutHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Logged out successfully"})
+}
+
+// GetUserHandler returns current user information
+func GetUserHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Get user ID from context (set by auth middleware)
+	userID, ok := r.Context().Value("userID").(string)
+	if !ok {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Unauthorized"})
+		return
+	}
+
+	db := database.Get()
+	usersCollection := db.Instance.Collection("users")
+
+	var user models.User
+	err := usersCollection.FindOne(r.Context(), bson.M{"_id": userID}).Decode(&user)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"message": "User not found"})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(UserResponse{
+		ID:        user.ID.Hex(),
+		Email:     user.Email,
+		FirstName: user.FirstName,
+		LastName:  user.LastName,
+		CreatedAt: user.CreatedAt.Format(time.RFC3339),
+	})
+}
+
+type ForgotPasswordRequest struct {
+	Email string `json:"email"`
+}
+
+type VerifyOTPRequest struct {
+	Email string `json:"email"`
+	OTP   string `json:"otp"`
+}
+
+type ResetPasswordRequest struct {
+	Email       string `json:"email"`
+	NewPassword string `json:"newPassword"`
+}
+
+// generateOTP creates a 6-digit numeric OTP
+func generateOTP() string {
+	return fmt.Sprintf("%06d", rand.Intn(900000)+100000)
+}
+
+// ForgotPasswordHandler sends OTP to user's email
+func ForgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req ForgotPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Invalid request body"})
+		return
+	}
+
+	if req.Email == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Email is required"})
+		return
+	}
+
+	db := database.Get()
+	usersCollection := db.Instance.Collection("users")
+
+	var user models.User
+	err := usersCollection.FindOne(r.Context(), bson.M{"email": req.Email}).Decode(&user)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"message": "User not found"})
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"message": "Database error"})
+		}
+		return
+	}
+
+	otp := generateOTP()
+	expiry := time.Now().Add(5 * time.Minute)
+
+	_, err = usersCollection.UpdateOne(r.Context(),
+		bson.M{"_id": user.ID},
+		bson.M{
+			"$set": bson.M{
+				"resetOtp":       otp,
+				"resetOtpExpiry": expiry,
+				"otpVerified":    false,
+				"updatedAt":      time.Now(),
+			},
+		},
+	)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Failed to save OTP"})
+		return
+	}
+
+	if err := utils.SendOTPEmail(req.Email, otp); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Failed to send email"})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "OTP sent to email"})
+}
+
+// VerifyOTPHandler verifies the OTP entered by user
+func VerifyOTPHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req VerifyOTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Invalid request body"})
+		return
+	}
+
+	if req.Email == "" || req.OTP == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Email and OTP are required"})
+		return
+	}
+
+	db := database.Get()
+	usersCollection := db.Instance.Collection("users")
+
+	var user models.User
+	err := usersCollection.FindOne(r.Context(), bson.M{"email": req.Email}).Decode(&user)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"message": "User not found"})
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"message": "Database error"})
+		}
+		return
+	}
+
+	if user.ResetOtp == "" || user.ResetOtp != req.OTP {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Invalid OTP"})
+		return
+	}
+
+	if time.Now().After(user.ResetOtpExpiry) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "OTP expired"})
+		return
+	}
+
+	_, err = usersCollection.UpdateOne(r.Context(),
+		bson.M{"_id": user.ID},
+		bson.M{
+			"$set": bson.M{
+				"otpVerified": true,
+				"updatedAt":   time.Now(),
+			},
+		},
+	)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Failed to verify OTP"})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "OTP verified"})
+}
+
+// ResetPasswordHandler resets the user's password after OTP verification
+func ResetPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req ResetPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Invalid request body"})
+		return
+	}
+
+	if req.Email == "" || req.NewPassword == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Email and new password are required"})
+		return
+	}
+
+	db := database.Get()
+	usersCollection := db.Instance.Collection("users")
+
+	var user models.User
+	err := usersCollection.FindOne(r.Context(), bson.M{"email": req.Email}).Decode(&user)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"message": "User not found"})
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"message": "Database error"})
+		}
+		return
+	}
+
+	if !user.OtpVerified {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"message": "OTP not verified"})
+		return
+	}
+
+	hashedPassword, err := utils.HashPassword(req.NewPassword)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Failed to hash password"})
+		return
+	}
+
+	_, err = usersCollection.UpdateOne(r.Context(),
+		bson.M{"_id": user.ID},
+		bson.M{
+			"$set": bson.M{
+				"password":       hashedPassword,
+				"resetOtp":       nil,
+				"resetOtpExpiry": nil,
+				"otpVerified":    false,
+				"updatedAt":      time.Now(),
+			},
+		},
+	)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Failed to update password"})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Password updated successfully"})
+}
